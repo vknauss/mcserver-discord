@@ -297,7 +297,7 @@ int send_interaction_response(const cJSON* response_json, const char* interactio
     char* endpoint_url = NULL;
     CURL* c = NULL;
     struct curl_slist* headers = NULL;
-    struct buffer_write_data buffer_write_data;
+    struct buffer_write_data buffer_write_data = { 0 };
 
     if (response_json)
     {
@@ -345,7 +345,10 @@ int send_interaction_response(const cJSON* response_json, const char* interactio
         cleanup_return(1);
     }
 
-    printf("interaction callback response: %.*s\n", (int)buffer_write_data.offset, buffer_write_data.buffer);
+    if (buffer_write_data.buffer)
+    {
+        printf("interaction callback response: %.*s\n", (int)buffer_write_data.offset, buffer_write_data.buffer);
+    }
 
 cleanup:
     free(buffer_write_data.buffer);
