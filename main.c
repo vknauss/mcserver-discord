@@ -14,6 +14,25 @@
 
 #define gateway_url_max_size 255
 
+// https://discord.com/developers/docs/events/gateway#gateway-intents
+#define gateway_intents (1 << 9) /* GUILD_MESSAGES */
+
+enum gateway_events
+{
+    GATEWAY_DISPATCH = 0,
+    GATEWAY_HEARTBEAT = 1,
+    GATEWAY_IDENTIFY = 2,
+    GATEWAY_PRESENCE_UPDATE = 3,
+    GATEWAY_VOICE_STATE_UPDATE = 4,
+    GATEWAY_RESUME = 6,
+    GATEWAY_RECONNECT = 7,
+    GATEWAY_REQUEST_GUILD_MEMBERS = 8,
+    GATEWAY_INVALID_SESSION = 9,
+    GATEWAY_HELLO = 10,
+    GATEWAY_HEARTBEAT_ACK = 11,
+    GATEWAY_REQUEST_SOUNDBOARD_SOUNDS = 31,
+};
+
 struct gateway_url_write_data
 {
     char* buffer;
@@ -84,15 +103,147 @@ cleanup:
 struct gateway_websocket_data
 {
     CURL* c;
+    int heartbeat_interval;
     int heartbeat_timer;
     size_t bufsize;
     size_t offset;
     char* buffer;
+    uint32_t sequence;
+    const char* token;
+    char* resume_gateway_url;
+    char* session_id;
 };
+
+cJSON* create_gateway_payload_json(int opcode)
+{
+    cJSON* json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(json, "op", opcode);
+    return json;
+}
+
+int send_gateway_payload_json(struct gateway_websocket_data* data, const cJSON* json)
+{
+    int ret = 0;
+    char* json_string = NULL;
+    if (json)
+    {
+        json_string = cJSON_PrintUnformatted(json);
+    }
+    if (!json_string)
+    {
+        fprintf(stderr, "failed to serialize payload json\n");
+        cleanup_return(1);
+    }
+
+    size_t size = strlen(json_string);
+    size_t rsize;
+    CURLcode code = curl_ws_send(data->c, json_string, size, &rsize, 0, CURLWS_TEXT);
+    if (code != CURLE_OK)
+    {
+        fprintf(stderr, "curl_ws_send failed: %s\n", curl_easy_strerror(code));
+        cleanup_return(1);
+    }
+
+cleanup:
+    free(json_string);
+    return ret;
+}
+
+int send_heartbeat(struct gateway_websocket_data* data)
+{
+    int ret = 0;
+    cJSON* payload_json = create_gateway_payload_json(GATEWAY_HEARTBEAT);
+    cJSON_AddNumberToObject(payload_json, "d", data->sequence);
+
+    if (send_gateway_payload_json(data, payload_json))
+    {
+        fprintf(stderr, "failed to send heartbeat payload\n");
+        cleanup_return(1);
+    }
+
+cleanup:
+    cJSON_Delete(payload_json);
+
+    return ret;
+}
+
+int send_identify(struct gateway_websocket_data* data)
+{
+    int ret = 0;
+    cJSON* payload_json = create_gateway_payload_json(GATEWAY_IDENTIFY);
+    cJSON* data_json = cJSON_AddObjectToObject(payload_json, "d");
+    cJSON_AddStringToObject(data_json, "token", data->token);
+    cJSON_AddNumberToObject(data_json, "intents", gateway_intents);
+    cJSON* properties_json = cJSON_AddObjectToObject(data_json, "properties");
+    cJSON_AddStringToObject(properties_json, "os", "linux");
+    cJSON_AddStringToObject(properties_json, "browser", "mcserver-discord");
+    cJSON_AddStringToObject(properties_json, "device", "mcserver-discord");
+
+    if (send_gateway_payload_json(data, payload_json))
+    {
+        fprintf(stderr, "failed to send identify payload\n");
+        cleanup_return(1);
+    }
+
+cleanup:
+    cJSON_Delete(payload_json);
+
+    return ret;
+}
+
+int handle_ready(struct gateway_websocket_data* data, const cJSON* event_data_json)
+{
+    if (!(data->session_id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event_data_json, "session_id"))))
+    {
+        fprintf(stderr, "failed to parse session_id\n");
+        return 1;
+    }
+    if (!(data->resume_gateway_url = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event_data_json, "resume_gateway_url"))))
+    {
+        fprintf(stderr, "failed to parse resume_gateway_url\n");
+        return 1;
+    }
+    return 0;
+}
+
+int handle_hello(struct gateway_websocket_data* data, const cJSON* event_data_json)
+{
+    int ret = 0;
+
+    cJSON* heartbeat_interval_json = cJSON_GetObjectItemCaseSensitive(event_data_json, "heartbeat_interval");
+    if (!cJSON_IsNumber(heartbeat_interval_json))
+    {
+        fprintf(stderr, "failed to parse heartbeat interval\n");
+        cleanup_return(1);
+    }
+
+    data->heartbeat_interval = heartbeat_interval_json->valueint;
+    uint64_t first_interval = (uint64_t)data->heartbeat_interval * rand() / RAND_MAX;
+    printf("setting heartbeat_timer: %d, initial: %lu\n", data->heartbeat_interval, first_interval);
+    if (timerfd_settime(data->heartbeat_timer, 0, &(struct itimerspec) {
+                .it_value.tv_sec = first_interval / 1000,
+                .it_value.tv_nsec = (first_interval % 1000) * 1000000,
+            }, NULL) != 0)
+    {
+        perror("timerfd_settime failed");
+        cleanup_return(1);
+    }
+
+    if (send_identify(data))
+    {
+        fprintf(stderr, "failed to send identify\n");
+        cleanup_return(1);
+    }
+
+cleanup:
+    return ret;
+}
 
 int handle_gateway_payload(struct gateway_websocket_data* data)
 {
     int ret = 0;
+    cJSON* response_json = NULL;
+    char* response_json_string = NULL;
     cJSON* gateway_payload_json = cJSON_ParseWithLength(data->buffer, data->offset);
     if (!gateway_payload_json)
     {
@@ -107,31 +258,70 @@ int handle_gateway_payload(struct gateway_websocket_data* data)
         cleanup_return(1);
     }
 
-    int op = op_code_json->valueint;
-    printf("opcode: %d\n", op);
+    cJSON* event_data_json = cJSON_GetObjectItemCaseSensitive(gateway_payload_json, "d");
 
-    if (op == 10) /* hello event */
+    int op = op_code_json->valueint;
+    if (op == GATEWAY_DISPATCH)
     {
-        cJSON* event_data_json = cJSON_GetObjectItemCaseSensitive(gateway_payload_json, "d");
-        cJSON* heartbeat_interval_json = cJSON_GetObjectItemCaseSensitive(event_data_json, "heartbeat_interval");
-        if (!cJSON_IsNumber(heartbeat_interval_json))
+        cJSON* sequence_json = cJSON_GetObjectItemCaseSensitive(gateway_payload_json, "s");
+        if (!cJSON_IsNumber(sequence_json))
         {
-            fprintf(stderr, "failed to parse heartbeat interval\n");
+            fprintf(stderr, "failed to parse dispatch sequence number\n");
+            cleanup_return(1);
+        }
+        data->sequence = sequence_json->valueint;
+
+        const char* event_name = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(gateway_payload_json, "t"));
+        if (!event_name)
+        {
+            fprintf(stderr, "failed to parse dispatch event name\n");
             cleanup_return(1);
         }
 
-        printf("setting heartbeat_timer: %d\n", heartbeat_interval_json->valueint);
-        if (timerfd_settime(data->heartbeat_timer, 0, &(struct itimerspec) {
-                    .it_value.tv_sec = heartbeat_interval_json->valueint / 1000,
-                    .it_value.tv_nsec = (heartbeat_interval_json->valueint % 1000) * 1000000,
-                }, NULL) != 0)
+        int ret = 0;
+        if (strcmp(event_name, "READY") == 0)
         {
-            perror("timerfd_settime failed");
+            ret = handle_ready(data, event_data_json);
+        }
+        else
+        {
+            fprintf(stderr, "unhandled dispatch event: %s\n", event_name);
+        }
+
+        if (ret)
+        {
+            fprintf(stderr, "failed to handle event: %s\n", event_name);
             cleanup_return(1);
         }
     }
+    else if (op == GATEWAY_HEARTBEAT)
+    {
+        if (send_heartbeat(data))
+        {
+            fprintf(stderr, "failed to send heartbeat\n");
+            cleanup_return(1);
+        }
+    }
+    else if (op == GATEWAY_HELLO)
+    {
+        if (handle_hello(data, event_data_json))
+        {
+            fprintf(stderr, "failed to handle hello event\n");
+            cleanup_return(1);
+        }
+    }
+    else if (op == GATEWAY_HEARTBEAT_ACK)
+    {
+        // TODO: handle as per https://discord.com/developers/docs/events/gateway#sending-heartbeats
+    }
+    else
+    {
+        fprintf(stderr, "unhandled opcode: %d\n", op);
+    }
 
 cleanup:
+    free(response_json_string);
+    cJSON_Delete(response_json);
     cJSON_Delete(gateway_payload_json);
     return ret;
 }
@@ -220,6 +410,12 @@ int run_websocket_client(CURL* c)
     int heartbeat_timer = -1;
     struct gateway_websocket_data gateway_websocket_data = { .c = c };
 
+    if (!(gateway_websocket_data.token = getenv("TOKEN")))
+    {
+        fprintf(stderr, "TOKEN environment variable not set\n");
+        cleanup_return(1);
+    }
+
     curl_socket_t ws_socket;
     if (curl_easy_getinfo(c, CURLINFO_ACTIVESOCKET, &ws_socket) != CURLE_OK)
     {
@@ -284,6 +480,21 @@ int run_websocket_client(CURL* c)
                     }
                     printf("heartbeat_timer: %lu\n", timeouts);
                     // TODO: send gateway heartbeat
+
+                    if (send_heartbeat(&gateway_websocket_data))
+                    {
+                        fprintf(stderr, "failed to send heartbeat\n");
+                        cleanup_return(1);
+                    }
+
+                    if (timerfd_settime(heartbeat_timer, 0, &(struct itimerspec) {
+                                .it_value.tv_sec = gateway_websocket_data.heartbeat_interval / 1000,
+                                .it_value.tv_nsec = (gateway_websocket_data.heartbeat_interval % 1000) * 1000000,
+                            }, NULL) != 0)
+                    {
+                        perror("timerfd_settime failed");
+                        cleanup_return(1);
+                    }
                 }
             }
             else if (event.data.fd == ws_socket)
