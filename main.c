@@ -1,10 +1,13 @@
 #include <assert.h>
 #include <cjson/cJSON.h>
 #include <curl/curl.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -16,6 +19,10 @@
 
 // https://discord.com/developers/docs/events/gateway#gateway-intents
 #define gateway_intents (1 << 9) /* GUILD_MESSAGES */
+
+#define add_whitelist_app_command "addme"
+
+#define rcon_login_id 37373
 
 enum gateway_events
 {
@@ -75,6 +82,13 @@ enum gateway_app_command_option_types
     GATEWAY_APP_CMD_OPT_MENTIONABLE = 9,
     GATEWAY_APP_CMD_OPT_NUMBER = 10,
     GATEWAY_APP_CMD_OPT_ATTACHMENT = 11,
+};
+
+enum rcon_packet_type
+{
+    RCON_PACKET_COMMAND_RESPONSE = 0,
+    RCON_PACKET_COMMAND = 2,
+    RCON_PACKET_LOGIN = 3,
 };
 
 struct buffer_write_data
@@ -150,6 +164,7 @@ cleanup:
 struct gateway_websocket_data
 {
     CURL* c;
+    int rcon_socket;
     int heartbeat_interval;
     int heartbeat_timer;
     size_t bufsize;
@@ -290,6 +305,227 @@ int handle_ready(struct gateway_websocket_data* data, const cJSON* event_data_js
     return 0;
 }
 
+int rcon_connect(const char* host, const char* port, const char* password)
+{
+    int ret = -1;
+    struct addrinfo* addrinfo = NULL;
+
+    const struct addrinfo hints = {
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+        .ai_protocol = IPPROTO_TCP,
+    };
+
+    int gai_code = getaddrinfo(host, port, &hints, &addrinfo);
+    if (gai_code != 0)
+    {
+        fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(gai_code));
+        cleanup_return(-1);
+    }
+
+    for (struct addrinfo* ai = addrinfo; ai; ai = ai->ai_next)
+    {
+        int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s < 0)
+        {
+            perror("socket failed");
+            continue;
+        }
+
+        int cc = connect(s, ai->ai_addr, ai->ai_addrlen);
+        if (cc < 0)
+        {
+            perror("connect failed");
+            close(s);
+            continue;
+        }
+
+        cleanup_return(s);
+    }
+
+cleanup:
+    if (addrinfo)
+    {
+        freeaddrinfo(addrinfo);
+    }
+    return ret;
+}
+
+int rcon_send(int rcon_socket, int32_t msg_id, int32_t msg_type, const char* body, int body_len)
+{
+    int ret = 0;
+    char* buffer = NULL;
+
+    int32_t size = 2 * sizeof(int32_t) + 2 + body_len;
+    if (size > 4096)
+    {
+        fprintf(stderr, "rcon packet too large\n");
+        cleanup_return(1);
+    }
+
+    buffer = malloc(sizeof(int32_t) + size);
+    memcpy(buffer, &size, sizeof(int32_t));
+    memcpy(buffer + sizeof(int32_t), &msg_id, sizeof(int32_t));
+    memcpy(buffer + 2 * sizeof(int32_t), &msg_type, sizeof(int32_t));
+    memcpy(buffer + 3 * sizeof(int32_t), body, body_len);
+    buffer[body_len + 3 * sizeof(int32_t)] = 0;
+    buffer[body_len + 3 * sizeof(int32_t) + 1] = 0;
+
+    size_t offset  = 0;
+    size_t remaining = sizeof(int32_t) + size;
+    do
+    {
+        ssize_t ns = write(rcon_socket, buffer + offset, remaining);
+        if (ns < 0)
+        {
+            perror("failed to write data");
+            cleanup_return(1);
+        }
+        offset += ns;
+        remaining -= ns;
+    } while (remaining > 0);
+
+cleanup:
+    free(buffer);
+    return ret;
+}
+
+int handle_receive_rcon(struct gateway_websocket_data* data)
+{
+    int ret = 0;
+    char* buffer = NULL;
+
+    int read_size;
+    if (ioctl(data->rcon_socket, FIONREAD, &read_size) < 0)
+    {
+        perror("ioctl failed");
+        cleanup_return(1);
+    }
+
+    if (read_size < 3 * sizeof(int32_t) + 2)
+    {
+        fprintf(stderr, "rcon packet too small\n");
+        cleanup_return(1);
+    }
+    if (read_size > 4096 + sizeof(int32_t))
+    {
+        fprintf(stderr, "rcon packet too large\n");
+        cleanup_return(1);
+    }
+
+    buffer = malloc(read_size);
+    size_t offset = 0;
+
+    do
+    {
+        ssize_t nr = read(data->rcon_socket, buffer + offset, read_size - offset);
+        if (nr < 0)
+        {
+            perror("failed to read socket");
+            cleanup_return(1);
+        }
+        offset += nr;
+    }
+    while (offset < read_size);
+
+    int32_t size, msg_id, msg_type;
+    memcpy(&size, buffer, sizeof(int32_t));
+    memcpy(&msg_id, buffer + sizeof(int32_t), sizeof(int32_t));
+    memcpy(&msg_type, buffer + 2 * sizeof(int32_t), sizeof(int32_t));
+    if (size > read_size - sizeof(int32_t))
+    {
+        fprintf(stderr, "bad rcon packet: size mismatch\n");
+        cleanup_return(1);
+    }
+
+    int data_len = size - 2 * sizeof(int32_t) - 2;
+    if (data_len < 0)
+    {
+        fprintf(stderr, "bad rcon packet: bad data length\n");
+        cleanup_return(1);
+    }
+
+    printf("got rcon packet: id: %d, type: %d, data: %.*s\n", msg_id, msg_type, data_len, buffer + 3 * sizeof(int32_t));
+
+cleanup:
+    free(buffer);
+    return ret;
+}
+
+int handle_command_whitelist_add(struct gateway_websocket_data* data, const cJSON* options, cJSON** response_json)
+{
+    int ret = 0;
+    char* cmd = NULL;
+
+    *response_json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(*response_json, "type", GATEWAY_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE);
+    cJSON* response_message_json = cJSON_AddObjectToObject(*response_json, "data");
+
+    const char* username = NULL;
+
+    int nopts = cJSON_GetArraySize(options);
+    for (int i = 0; i < nopts; ++i)
+    {
+        const cJSON* opt_json = cJSON_GetArrayItem(options, i);
+        const char* name = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(opt_json, "name"));
+        if (!name)
+        {
+            fprintf(stderr, "failed to parse option name\n");
+            goto error;
+        }
+
+        if (strcmp(name, "username") == 0)
+        {
+            username = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(opt_json, "value"));
+        }
+        else
+        {
+            fprintf(stderr, "unhandled option: %s\n", name);
+        }
+    }
+
+    if (!username)
+    {
+        fprintf(stderr, "failed to parse username\n");
+        goto error;
+    }
+
+    int username_len = strlen(username);
+
+#define msg_base "got add command for username: "
+    char* msg_str = malloc(sizeof(msg_base) + username_len);
+    memcpy(msg_str, msg_base, sizeof(msg_base));
+    strcpy(msg_str + sizeof(msg_base) - 1, username);
+#undef msg_base
+
+    printf("%s\n", msg_str);
+    cJSON_AddStringToObject(response_message_json, "content", msg_str);
+    free(msg_str);
+    msg_str = NULL;
+
+#define cmd_base "/whitelist add "
+    cmd = malloc(sizeof(cmd_base) + username_len);
+    memcpy(cmd, cmd_base, sizeof(cmd_base));
+    strcpy(cmd + sizeof(cmd_base) - 1, username);
+
+    if (rcon_send(data->rcon_socket, 0, RCON_PACKET_COMMAND, cmd, username_len + sizeof(cmd_base) - 1))
+    {
+        fprintf(stderr, "failed to send whitelist command rcon");
+        goto error;
+    }
+#undef cmd_base
+
+    goto end;
+
+error:
+    cJSON_AddStringToObject(response_message_json, "content", "error handling command");
+    ret = 1;
+
+end:
+    free(cmd);
+    return ret;
+}
+
 int send_interaction_response(const cJSON* response_json, const char* interaction_id, const char* interaction_token)
 {
     int ret = 0;
@@ -389,13 +625,36 @@ int handle_interaction_create(struct gateway_websocket_data* data, const cJSON* 
     if (type == GATEWAY_INTERACTION_APPLICATION_COMMAND)
     {
         cJSON* app_cmd_json = cJSON_GetObjectItemCaseSensitive(event_data_json, "data");
+        cJSON* app_cmd_options_json = cJSON_GetObjectItemCaseSensitive(app_cmd_json, "options");
 
-        response_json = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response_json, "type", GATEWAY_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE);
-        cJSON* response_message_json = cJSON_AddObjectToObject(response_json, "data");
-        cJSON_AddStringToObject(response_message_json, "content", "hello world");
+        const char* name = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(app_cmd_json, "name"));
+        if (!name)
+        {
+            fprintf(stderr, "failed to parse app command name\n");
+            goto end;
+        }
+
+        if (strcmp(name, add_whitelist_app_command) == 0)
+        {
+            if (handle_command_whitelist_add(data, app_cmd_options_json, &response_json))
+            {
+                fprintf(stderr, "failed to handle whitelist add command\n");
+                goto end;
+            }
+        }
+        else
+        {
+            response_json = cJSON_CreateObject();
+            cJSON_AddNumberToObject(response_json, "type", GATEWAY_INTERACTION_CALLBACK_CHANNEL_MESSAGE_WITH_SOURCE);
+            cJSON* response_message_json = cJSON_AddObjectToObject(response_json, "data");
+            cJSON_AddStringToObject(response_message_json, "content", "unhandled command");
+            fprintf(stderr, "unhandled command: %s\n", name);
+        }
+
+        printf("handled command: %s\n", name);
     }
 
+end:
     if (response_json)
     {
         if (send_interaction_response(response_json, interaction_id, interaction_token))
@@ -637,6 +896,7 @@ int create_app_command(const char* app_id, const char* token, const cJSON* comma
         fprintf(stderr, "failed to serialize app command json\n");
         cleanup_return(1);
     }
+    printf("serialized app command json: %s\n", json_string);
 
     curl_easy_setopt(c, CURLOPT_URL, endpoint_url);
     curl_easy_setopt(c, CURLOPT_POST, 1);
@@ -668,13 +928,20 @@ int create_app_commands(struct gateway_websocket_data* data)
 {
     int ret = 0;
     cJSON* command_json = cJSON_CreateObject();
-    cJSON_AddStringToObject(command_json, "name", "testcmd");
+    cJSON_AddStringToObject(command_json, "name", add_whitelist_app_command);
     cJSON_AddNumberToObject(command_json, "type", GATEWAY_APP_CMD_CHAT_INPUT);
-    cJSON_AddStringToObject(command_json, "description", "testcmd desc");
+    cJSON_AddStringToObject(command_json, "description", "add user to whitelist");
+    cJSON* options_json = cJSON_AddArrayToObject(command_json, "options");
+    cJSON* username_option_json = cJSON_CreateObject();
+    cJSON_AddNumberToObject(username_option_json, "type", GATEWAY_APP_CMD_OPT_STRING);
+    cJSON_AddStringToObject(username_option_json, "name", "username");
+    cJSON_AddStringToObject(username_option_json, "description", "username to add");
+    cJSON_AddBoolToObject(username_option_json, "required", 1);
+    cJSON_AddItemToArray(options_json, username_option_json);
 
     if (create_app_command(data->app_id, data->token, command_json))
     {
-        fprintf(stderr, "failed to create testcmd\n");
+        fprintf(stderr, "failed to create command: %s\n", add_whitelist_app_command);
         cleanup_return(1);
     }
 
@@ -683,12 +950,15 @@ cleanup:
     return ret;
 }
 
-int run_websocket_client(CURL* c)
+int run_websocket_client(CURL* c, int rcon_socket)
 {
     int ret = 0;
     int efd = -1;
     int heartbeat_timer = -1;
-    struct gateway_websocket_data gateway_websocket_data = { .c = c };
+    struct gateway_websocket_data gateway_websocket_data = {
+        .c = c,
+        .rcon_socket = rcon_socket,
+    };
 
     if (!(gateway_websocket_data.token = getenv("TOKEN")))
     {
@@ -745,6 +1015,12 @@ int run_websocket_client(CURL* c)
     }
     gateway_websocket_data.heartbeat_timer = heartbeat_timer;
 
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, rcon_socket, &(struct epoll_event){ .events = EPOLLIN, .data.fd = rcon_socket }) != 0)
+    {
+        perror("epoll_ctl failed");
+        cleanup_return(1);
+    }
+
     while (1)
     {
         struct epoll_event event;
@@ -799,6 +1075,16 @@ int run_websocket_client(CURL* c)
                     }
                 }
             }
+            else if (event.data.fd == rcon_socket)
+            {
+                if (event.events & EPOLLIN)
+                {
+                    if (handle_receive_rcon(&gateway_websocket_data))
+                    {
+                        fprintf(stderr, "failed to handle rcon response");
+                    }
+                }
+            }
         }
     }
 
@@ -818,8 +1104,39 @@ cleanup:
 int main(int argc, char** argv)
 {
     int ret = 0;
+    int rcon_socket = -1;
     char* gateway_url = NULL;
     CURL* c = NULL;
+
+    const char* rcon_host = getenv("RCON_HOST");
+    const char* rcon_port = getenv("RCON_PORT");
+    const char* rcon_password = getenv("RCON_PASSWORD");
+    if (!rcon_host)
+    {
+        rcon_host = "localhost";
+    }
+    if (!rcon_port)
+    {
+        rcon_port = "25575";
+    }
+    if (!rcon_password)
+    {
+        fprintf(stderr, "required environment variable RCON_PASSWORD not set\n");
+        cleanup_return(1);
+    }
+
+    rcon_socket = rcon_connect(rcon_host, rcon_port, rcon_password);
+    if (rcon_socket < 0)
+    {
+        fprintf(stderr, "failed to connect to rcon\n");
+        cleanup_return(1);
+    }
+
+    if (rcon_send(rcon_socket, rcon_login_id, RCON_PACKET_LOGIN, rcon_password, strlen(rcon_password)))
+    {
+        fprintf(stderr, "failed to send rcon login password\n");
+        cleanup_return(1);
+    }
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
     {
@@ -842,7 +1159,7 @@ int main(int argc, char** argv)
 
     printf("connected to gateway\n");
 
-    if (run_websocket_client(c))
+    if (run_websocket_client(c, rcon_socket))
     {
         fprintf(stderr, "error running websocket client\n");
         cleanup_return(1);
@@ -854,6 +1171,10 @@ cleanup:
     curl_easy_cleanup(c);
     free(gateway_url);
     curl_global_cleanup();
+    if (rcon_socket >= 0)
+    {
+        close(rcon_socket);
+    }
 
     return ret;
 }
