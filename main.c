@@ -18,9 +18,6 @@
 #define discord_get_gateway_url (discord_api_url"/gateway")
 #define gateway_query_params "/?v=10&encoding=json"
 
-// https://discord.com/developers/docs/events/gateway#gateway-intents
-#define gateway_intents (1 << 9) /* GUILD_MESSAGES */
-
 #define add_whitelist_app_command "addme"
 
 #define rcon_login_id 777
@@ -242,7 +239,7 @@ int send_identify(struct gateway_websocket_data* data)
     cJSON* payload_json = create_gateway_payload_json(GATEWAY_IDENTIFY);
     cJSON* data_json = cJSON_AddObjectToObject(payload_json, "d");
     cJSON_AddStringToObject(data_json, "token", data->token);
-    cJSON_AddNumberToObject(data_json, "intents", gateway_intents);
+    cJSON_AddNumberToObject(data_json, "intents", 0);
     cJSON* properties_json = cJSON_AddObjectToObject(data_json, "properties");
     cJSON_AddStringToObject(properties_json, "os", "linux");
     cJSON_AddStringToObject(properties_json, "browser", "mcserver-discord");
@@ -460,8 +457,6 @@ int handle_receive_rcon(int rcon_socket, rcon_callback callback, void* userdata)
     }
 
     const char* data_str = buffer + 3 * sizeof(int32_t);
-    printf("got rcon packet: id: %d, type: %d, data: %s\n", msg_id, msg_type, data_str);
-
     if (callback(msg_id, msg_type, data_str, data_len, userdata))
     {
         fprintf(stderr, "packet callback bad return status\n");
@@ -578,7 +573,6 @@ int send_interaction_response(const cJSON* response_json, const char* interactio
     char* endpoint_url = NULL;
     CURL* c = NULL;
     struct curl_slist* headers = NULL;
-    struct buffer_write_data buffer_write_data = { 0 };
 
     if (response_json)
     {
@@ -616,8 +610,6 @@ int send_interaction_response(const cJSON* response_json, const char* interactio
     curl_easy_setopt(c, CURLOPT_POST, 1);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, json_string);
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, buffer_write_callback);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &buffer_write_data);
 
     CURLcode code = curl_easy_perform(c);
     if (code != CURLE_OK)
@@ -626,13 +618,7 @@ int send_interaction_response(const cJSON* response_json, const char* interactio
         cleanup_return(1);
     }
 
-    if (buffer_write_data.buffer)
-    {
-        printf("interaction callback response: %.*s\n", (int)buffer_write_data.offset, buffer_write_data.buffer);
-    }
-
 cleanup:
-    free(buffer_write_data.buffer);
     curl_slist_free_all(headers);
     curl_easy_cleanup(c);
     free(endpoint_url);
@@ -757,6 +743,10 @@ int handle_gateway_payload(struct gateway_websocket_data* data)
         if (strcmp(event_name, "READY") == 0)
         {
             ret = handle_ready(data, event_data_json);
+            if (!ret)
+            {
+                printf("handshake with gateway server completed\n");
+            }
         }
         else if (strcmp(event_name, "INTERACTION_CREATE") == 0)
         {
@@ -813,7 +803,6 @@ int gateway_websocket_receive(struct gateway_websocket_data* data)
     while (1)
     {
         CURLcode r = curl_ws_recv(data->c, data->buffer + data->offset, data->bufsize - data->offset, &rlen, &frame);
-        printf("curl_ws_recv returned: %d %s\n", r, r == CURLE_OK ? "CURLE_OK" : r == CURLE_GOT_NOTHING ? "CURLE_GOT_NOTHING" : r == CURLE_AGAIN ? "CURLE_AGAIN" : "unknown");
         if (r == CURLE_AGAIN)
         {
             break;
@@ -824,7 +813,6 @@ int gateway_websocket_receive(struct gateway_websocket_data* data)
             return 1;
         }
 
-        printf("frame: 0x%X, %lu, %lu, %lu\n", frame->flags, frame->offset, frame->bytesleft, frame->len);
         data->offset += rlen;
 
         if (frame->bytesleft > data->bufsize - data->offset)
@@ -835,18 +823,6 @@ int gateway_websocket_receive(struct gateway_websocket_data* data)
 
         if (!frame->bytesleft)
         {
-            printf("read buffer: %.*s\n", (int)data->offset, data->buffer);
-            if(data->offset <= 8)
-            {
-                unsigned long v = 0;
-                for (size_t i = 0; i < data->offset; ++i)
-                {
-                    v = v << 8;
-                    v = v | ((unsigned char*)data->buffer)[i];
-                }
-                printf("as integer: 0x%lX / %lu\n", v, v);
-            }
-
             if (handle_gateway_payload(data))
             {
                 fprintf(stderr, "failed to handle gateway payload\n");
@@ -871,7 +847,6 @@ CURL* connect_to_gateway(const char* url)
 
     curl_easy_setopt(c, CURLOPT_URL, url);
     curl_easy_setopt(c, CURLOPT_CONNECT_ONLY, 2);
-    // curl_easy_setopt(c, CURLOPT_VERBOSE, 1);
 
     CURLcode code = curl_easy_perform(c);
     if (code != CURLE_OK)
@@ -893,6 +868,7 @@ int create_app_command(const char* app_id, const char* token, const cJSON* comma
     char* bot_header = NULL;
     char* json_string = NULL;
     struct buffer_write_data buffer_write_data = { 0 };
+    cJSON* response_json = NULL;
 
     const char* fmt = discord_api_url"/applications/%s/commands";
     int sz = snprintf(NULL, 0, fmt, app_id);
@@ -941,7 +917,6 @@ int create_app_command(const char* app_id, const char* token, const cJSON* comma
         fprintf(stderr, "failed to serialize app command json\n");
         cleanup_return(1);
     }
-    printf("serialized app command json: %s\n", json_string);
 
     curl_easy_setopt(c, CURLOPT_URL, endpoint_url);
     curl_easy_setopt(c, CURLOPT_POST, 1);
@@ -957,9 +932,22 @@ int create_app_command(const char* app_id, const char* token, const cJSON* comma
         cleanup_return(1);
     }
 
-    printf("got response to add app command: %.*s\n", (int)buffer_write_data.offset, buffer_write_data.buffer);
+    response_json = cJSON_ParseWithLength(buffer_write_data.buffer, buffer_write_data.offset);
+    const char* response_name_str = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(response_json, "name"));
+    if (!response_name_str)
+    {
+        fprintf(stderr, "failed to parse app command name from add command response\n");
+        cleanup_return(1);
+    }
+
+    if (strcmp(response_name_str, cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(command_json, "name"))) != 0)
+    {
+        fprintf(stderr, "app command response name does not match requested add command name\n");
+        cleanup_return(1);
+    }
 
 cleanup:
+    cJSON_Delete(response_json);
     free(buffer_write_data.buffer);
     free(json_string);
     free(bot_header);
@@ -1023,6 +1011,8 @@ int run_websocket_client(CURL* c, int rcon_socket)
         cleanup_return(1);
     }
 
+    printf("app commands registered\n");
+
     curl_socket_t ws_socket;
     if (curl_easy_getinfo(c, CURLINFO_ACTIVESOCKET, &ws_socket) != CURLE_OK)
     {
@@ -1064,7 +1054,6 @@ int run_websocket_client(CURL* c, int rcon_socket)
     {
         struct epoll_event event;
         int epr = epoll_wait(efd, &event, 1, -1);
-        printf("epr: %d \n", epr);
 
         if (epr < 0)
         {
@@ -1085,7 +1074,6 @@ int run_websocket_client(CURL* c, int rcon_socket)
                         perror("read failed");
                         cleanup_return(1);
                     }
-                    printf("heartbeat_timer: %lu\n", timeouts);
 
                     if (send_heartbeat(&gateway_websocket_data))
                     {
@@ -1137,7 +1125,6 @@ int rcon_auth_callback(int msg_id, int msg_type, const char* data_str, int data_
         fprintf(stderr, "rcon login failed: %s\n", data_str);
         return 1;
     }
-    printf("rcon login success: %s\n", data_str);
     return 0;
 }
 
@@ -1190,6 +1177,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "failed to authenticate rcon with server\n");
         cleanup_return(1);
     }
+
+    printf("connected to server rcon\n");
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
     {
