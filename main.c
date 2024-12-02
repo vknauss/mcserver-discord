@@ -168,6 +168,8 @@ struct gateway_websocket_data
 {
     CURL* c;
     int rcon_socket;
+    int ws_socket;
+    int epoll_fd;
     int heartbeat_interval;
     int heartbeat_timer;
     size_t bufsize;
@@ -176,6 +178,7 @@ struct gateway_websocket_data
     uint32_t sequence;
     const char* token;
     const char* app_id;
+    const char* gateway_url;
     char* resume_gateway_url;
     char* session_id;
 };
@@ -257,6 +260,27 @@ cleanup:
     return ret;
 }
 
+int send_resume(struct gateway_websocket_data* data)
+{
+    int ret = 0;
+    cJSON* payload_json = create_gateway_payload_json(GATEWAY_RESUME);
+    cJSON* data_json = cJSON_AddObjectToObject(payload_json, "d");
+    cJSON_AddStringToObject(data_json, "token", data->token);
+    cJSON_AddStringToObject(data_json, "session_id", data->session_id);
+    cJSON_AddNumberToObject(data_json, "seq", data->sequence);
+
+    if (send_gateway_payload_json(data, payload_json))
+    {
+        fprintf(stderr, "failed to send resume payload\n");
+        cleanup_return(1);
+    }
+
+cleanup:
+    cJSON_Delete(payload_json);
+
+    return ret;
+}
+
 int handle_hello(struct gateway_websocket_data* data, const cJSON* event_data_json)
 {
     int ret = 0;
@@ -292,18 +316,31 @@ cleanup:
 
 int handle_ready(struct gateway_websocket_data* data, const cJSON* event_data_json)
 {
-    if (!(data->session_id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event_data_json, "session_id"))))
+    const char* session_id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event_data_json, "session_id"));
+    const char* resume_gateway_url = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event_data_json, "resume_gateway_url"));
+    if (!session_id)
     {
         fprintf(stderr, "failed to parse session_id\n");
         return 1;
     }
-    if (!(data->resume_gateway_url = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(event_data_json, "resume_gateway_url"))))
+    if (!resume_gateway_url)
     {
         fprintf(stderr, "failed to parse resume_gateway_url\n");
         return 1;
     }
 
-    printf("got session_id: %s, resume_gateway_url: %s\n", data->session_id, data->resume_gateway_url);
+    printf("got session_id: %s, resume_gateway_url: %s\n", session_id, resume_gateway_url);
+
+    free(data->session_id);
+    free(data->resume_gateway_url);
+
+    data->session_id = malloc(strlen(session_id) + 1);
+    strcpy(data->session_id, session_id);
+
+    int url_length = strlen(resume_gateway_url);
+    data->resume_gateway_url = malloc(url_length + sizeof(gateway_query_params));
+    memcpy(data->resume_gateway_url, resume_gateway_url, url_length);
+    memcpy(data->resume_gateway_url + url_length, gateway_query_params, sizeof(gateway_query_params));
 
     return 0;
 }
@@ -700,6 +737,92 @@ cleanup:
     return ret;
 }
 
+CURL* connect_to_gateway(const char* url)
+{
+    CURL* c = curl_easy_init();
+    if (!c)
+    {
+        fprintf(stderr, "curl_easy_init failed\n");
+        return NULL;
+    }
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_CONNECT_ONLY, 2);
+
+    CURLcode code = curl_easy_perform(c);
+    if (code != CURLE_OK)
+    {
+        fprintf(stderr, "curl_easy_perform failed: %s\n", curl_easy_strerror(code));
+        curl_easy_cleanup(c);
+        return NULL;
+    }
+
+    return c;
+}
+
+int update_ws_socket(struct gateway_websocket_data* data)
+{
+    int ret = 0;
+
+    if (curl_easy_getinfo(data->c, CURLINFO_ACTIVESOCKET, &data->ws_socket) != CURLE_OK)
+    {
+        fprintf(stderr, "curl_easy_getinfo failed\n");
+        cleanup_return(1);
+    }
+
+    if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->ws_socket,
+            &(struct epoll_event) {
+                .events = EPOLLIN,
+                .data.fd = data->ws_socket,
+            }) != 0)
+    {
+        perror("epoll_ctl failed");
+        cleanup_return(1);
+    }
+
+cleanup:
+    return ret;
+}
+
+int handle_reconnect(struct gateway_websocket_data* data)
+{
+    int ret = 0;
+
+    if (data->ws_socket >= 0)
+    {
+        if (epoll_ctl(data->epoll_fd, EPOLL_CTL_DEL, data->ws_socket, NULL) != 0)
+        {
+            perror("epoll_ctl failed");
+            cleanup_return(1);
+        }
+    }
+    curl_easy_cleanup(data->c);
+
+    data->c = connect_to_gateway(data->resume_gateway_url ? data->resume_gateway_url : data->gateway_url);
+    if (!data->c)
+    {
+        fprintf(stderr, "failed to reconnect to gateway\n");
+        cleanup_return(1);
+    }
+
+    if (update_ws_socket(data))
+    {
+        fprintf(stderr, "failed to assign websocket to event handler\n");
+        cleanup_return(1);
+    }
+
+    printf("reconnected to gateway\n");
+
+    if (send_resume(data))
+    {
+        fprintf(stderr, "failed to send resume event\n");
+        cleanup_return(1);
+    }
+
+cleanup:
+    return ret;
+}
+
 int handle_gateway_payload(struct gateway_websocket_data* data)
 {
     int ret = 0;
@@ -771,6 +894,14 @@ int handle_gateway_payload(struct gateway_websocket_data* data)
             cleanup_return(1);
         }
     }
+    else if (op == GATEWAY_RECONNECT)
+    {
+        if (handle_reconnect(data))
+        {
+            fprintf(stderr, "failed to handle reconnect event\n");
+            cleanup_return(1);
+        }
+    }
     else if (op == GATEWAY_HELLO)
     {
         if (handle_hello(data, event_data_json))
@@ -834,29 +965,6 @@ int gateway_websocket_receive(struct gateway_websocket_data* data)
     }
 
     return 0;
-}
-
-CURL* connect_to_gateway(const char* url)
-{
-    CURL* c = curl_easy_init();
-    if (!c)
-    {
-        fprintf(stderr, "curl_easy_init failed\n");
-        return NULL;
-    }
-
-    curl_easy_setopt(c, CURLOPT_URL, url);
-    curl_easy_setopt(c, CURLOPT_CONNECT_ONLY, 2);
-
-    CURLcode code = curl_easy_perform(c);
-    if (code != CURLE_OK)
-    {
-        fprintf(stderr, "curl_easy_perform failed: %s\n", curl_easy_strerror(code));
-        curl_easy_cleanup(c);
-        return NULL;
-    }
-
-    return c;
 }
 
 int create_app_command(const char* app_id, const char* token, const cJSON* command_json)
@@ -983,14 +1091,16 @@ cleanup:
     return ret;
 }
 
-int run_websocket_client(CURL* c, int rcon_socket)
+int run_websocket_client(CURL* c, int rcon_socket, const char* gateway_url)
 {
     int ret = 0;
-    int efd = -1;
     int heartbeat_timer = -1;
     struct gateway_websocket_data gateway_websocket_data = {
         .c = c,
         .rcon_socket = rcon_socket,
+        .ws_socket = -1,
+        .epoll_fd = -1,
+        .gateway_url = gateway_url,
     };
 
     if (!(gateway_websocket_data.token = getenv("TOKEN")))
@@ -1013,26 +1123,16 @@ int run_websocket_client(CURL* c, int rcon_socket)
 
     printf("app commands registered\n");
 
-    curl_socket_t ws_socket;
-    if (curl_easy_getinfo(c, CURLINFO_ACTIVESOCKET, &ws_socket) != CURLE_OK)
-    {
-        fprintf(stderr, "curl_easy_getinfo failed\n");
-        cleanup_return(1);
-    }
-
-    efd = epoll_create1(0);
-    if (efd == -1)
+    gateway_websocket_data.epoll_fd = epoll_create1(0);
+    if (gateway_websocket_data.epoll_fd == -1)
     {
         perror("epoll_create1 failed");
         cleanup_return(1);
     }
 
-    if (epoll_ctl(efd, EPOLL_CTL_ADD, ws_socket, &(struct epoll_event) {
-                .events = EPOLLIN,
-                .data.fd = ws_socket,
-            }) != 0)
+    if (update_ws_socket(&gateway_websocket_data))
     {
-        perror("epoll_ctl failed");
+        fprintf(stderr, "failed to assign websocket to event handler\n");
         cleanup_return(1);
     }
 
@@ -1043,7 +1143,11 @@ int run_websocket_client(CURL* c, int rcon_socket)
         cleanup_return(1);
     }
 
-    if (epoll_ctl(efd, EPOLL_CTL_ADD, heartbeat_timer, &(struct epoll_event){ .events = EPOLLIN, .data.fd = heartbeat_timer }) != 0)
+    if (epoll_ctl(gateway_websocket_data.epoll_fd, EPOLL_CTL_ADD, heartbeat_timer,
+            &(struct epoll_event) {
+                .events = EPOLLIN,
+                .data.fd = heartbeat_timer
+            }) != 0)
     {
         perror("epoll_ctl failed");
         cleanup_return(1);
@@ -1053,7 +1157,7 @@ int run_websocket_client(CURL* c, int rcon_socket)
     while (1)
     {
         struct epoll_event event;
-        int epr = epoll_wait(efd, &event, 1, -1);
+        int epr = epoll_wait(gateway_websocket_data.epoll_fd, &event, 1, -1);
 
         if (epr < 0)
         {
@@ -1091,7 +1195,7 @@ int run_websocket_client(CURL* c, int rcon_socket)
                     }
                 }
             }
-            else if (event.data.fd == ws_socket)
+            else if (event.data.fd == gateway_websocket_data.ws_socket)
             {
                 if (event.events & EPOLLIN)
                 {
@@ -1107,14 +1211,18 @@ int run_websocket_client(CURL* c, int rcon_socket)
 
 cleanup:
     free(gateway_websocket_data.buffer);
+    free(gateway_websocket_data.session_id);
+    free(gateway_websocket_data.resume_gateway_url);
     if (heartbeat_timer > -1)
     {
         close(heartbeat_timer);
     }
-    if (efd > -1)
+    if (gateway_websocket_data.epoll_fd > -1)
     {
-        close(efd);
+        close(gateway_websocket_data.epoll_fd);
     }
+    curl_easy_cleanup(gateway_websocket_data.c);
+
     return ret;
 }
 
@@ -1201,11 +1309,13 @@ int main(int argc, char** argv)
 
     printf("connected to gateway\n");
 
-    if (run_websocket_client(c, rcon_socket))
+    if (run_websocket_client(c, rcon_socket, gateway_url))
     {
+        c = NULL;
         fprintf(stderr, "error running websocket client\n");
         cleanup_return(1);
     }
+    c = NULL; /* gets freed during run_websocket_client, TODO: refactor to be less messy */
 
     printf("exiting\n");
 
