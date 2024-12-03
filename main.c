@@ -293,7 +293,8 @@ int handle_hello(struct gateway_websocket_data* data, const cJSON* event_data_js
     }
 
     data->heartbeat_interval = heartbeat_interval_json->valueint;
-    uint64_t first_interval = (uint64_t)data->heartbeat_interval * rand() / RAND_MAX;
+    srand48(time(0));
+    uint64_t first_interval = (uint64_t)data->heartbeat_interval * lrand48() / INT32_MAX;
     printf("setting heartbeat_timer: %d, initial: %lu\n", data->heartbeat_interval, first_interval);
     if (timerfd_settime(data->heartbeat_timer, 0, &(struct itimerspec) {
                 .it_value.tv_sec = first_interval / 1000,
@@ -304,11 +305,24 @@ int handle_hello(struct gateway_websocket_data* data, const cJSON* event_data_js
         cleanup_return(1);
     }
 
-    if (send_identify(data))
+    if (data->session_id)
     {
-        fprintf(stderr, "failed to send identify\n");
-        cleanup_return(1);
+        if (send_resume(data))
+        {
+            fprintf(stderr, "failed to send resume\n");
+            cleanup_return(1);
+        }
     }
+    else
+    {
+        if (send_identify(data))
+        {
+            fprintf(stderr, "failed to send identify\n");
+            cleanup_return(1);
+        }
+    }
+
+    printf("gateway server acknowledged connection\n");
 
 cleanup:
     return ret;
@@ -328,8 +342,6 @@ int handle_ready(struct gateway_websocket_data* data, const cJSON* event_data_js
         fprintf(stderr, "failed to parse resume_gateway_url\n");
         return 1;
     }
-
-    printf("got session_id: %s, resume_gateway_url: %s\n", session_id, resume_gateway_url);
 
     free(data->session_id);
     free(data->resume_gateway_url);
@@ -798,7 +810,10 @@ int handle_reconnect(struct gateway_websocket_data* data)
     }
     curl_easy_cleanup(data->c);
 
-    data->c = connect_to_gateway(data->resume_gateway_url ? data->resume_gateway_url : data->gateway_url);
+    const char* gateway_url = data->resume_gateway_url ? data->resume_gateway_url : data->gateway_url;
+    printf("attempting to reconnect to gateway url: %s\n", gateway_url);
+
+    data->c = connect_to_gateway(gateway_url);
     if (!data->c)
     {
         fprintf(stderr, "failed to reconnect to gateway\n");
@@ -812,12 +827,6 @@ int handle_reconnect(struct gateway_websocket_data* data)
     }
 
     printf("reconnected to gateway\n");
-
-    if (send_resume(data))
-    {
-        fprintf(stderr, "failed to send resume event\n");
-        cleanup_return(1);
-    }
 
 cleanup:
     return ret;
@@ -871,6 +880,10 @@ int handle_gateway_payload(struct gateway_websocket_data* data)
                 printf("handshake with gateway server completed\n");
             }
         }
+        else if (strcmp(event_name, "RESUMED") == 0)
+        {
+            printf("connection resume completed\n");
+        }
         else if (strcmp(event_name, "INTERACTION_CREATE") == 0)
         {
             ret = handle_interaction_create(data, event_data_json);
@@ -902,6 +915,24 @@ int handle_gateway_payload(struct gateway_websocket_data* data)
             cleanup_return(1);
         }
     }
+    else if (op == GATEWAY_INVALID_SESSION)
+    {
+        int resumable = cJSON_IsTrue(event_data_json);
+        printf("session invalidated by gateway server. resumable: %d\n", resumable);
+        if (!resumable)
+        {
+            // invalidate session
+            free(data->session_id);
+            free(data->resume_gateway_url);
+            data->session_id = NULL;
+            data->resume_gateway_url = NULL;
+        }
+        if (handle_reconnect(data))
+        {
+            fprintf(stderr, "failed to reconnect after invalid session\n");
+            cleanup_return(1);
+        }
+    }
     else if (op == GATEWAY_HELLO)
     {
         if (handle_hello(data, event_data_json))
@@ -929,7 +960,7 @@ cleanup:
 int gateway_websocket_receive(struct gateway_websocket_data* data)
 {
     size_t rlen;
-    const struct curl_ws_frame* frame;
+    const struct curl_ws_frame* frame = NULL;
 
     while (1)
     {
@@ -940,7 +971,7 @@ int gateway_websocket_receive(struct gateway_websocket_data* data)
         }
         if (r)
         {
-            fprintf(stderr, "curl_ws_recv failed: %s\n", curl_easy_strerror(r));
+            fprintf(stderr, "curl_ws_recv failed: %d (%s)\n", r, curl_easy_strerror(r));
             return 1;
         }
 
@@ -954,10 +985,19 @@ int gateway_websocket_receive(struct gateway_websocket_data* data)
 
         if (!frame->bytesleft)
         {
-            if (handle_gateway_payload(data))
+            if (frame->flags & CURLWS_CLOSE)
+            {
+                printf("websocket closed with message: %.*s\n", (int)data->offset, data->buffer);
+                if (handle_reconnect(data))
+                {
+                    fprintf(stderr, "failed to reconnect after received close\n");
+                    return 1;
+                }
+            }
+            else if (handle_gateway_payload(data))
             {
                 fprintf(stderr, "failed to handle gateway payload\n");
-                return 1;
+                return 2;
             }
 
             data->offset = 0;
@@ -1199,10 +1239,12 @@ int run_websocket_client(CURL* c, int rcon_socket, const char* gateway_url)
             {
                 if (event.events & EPOLLIN)
                 {
-                    if (gateway_websocket_receive(&gateway_websocket_data))
+                    int status = gateway_websocket_receive(&gateway_websocket_data);
+                    if (status != 0)
                     {
-                        fprintf(stderr, "websocket receive failed\n");
-                        cleanup_return(1);
+                        fprintf(stderr, "websocket receive failed: poll events: %X\n", event.events);
+                        if (status == 1)
+                            cleanup_return(1);
                     }
                 }
             }
