@@ -969,9 +969,22 @@ int gateway_websocket_receive(struct gateway_websocket_data* data)
         {
             break;
         }
+        if (r == CURLE_GOT_NOTHING)
+        {
+            fprintf(stderr, "websocket closed without message\n");
+            if (handle_reconnect(data))
+            {
+                fprintf(stderr, "failed to reconnect after closed websocket\n");
+                return 1;
+            }
+        }
         if (r)
         {
             fprintf(stderr, "curl_ws_recv failed: %d (%s)\n", r, curl_easy_strerror(r));
+            if (frame)
+            {
+                fprintf(stderr, "got frame flags: %X\n", frame->flags);
+            }
             return 1;
         }
 
